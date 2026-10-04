@@ -508,21 +508,6 @@ export function getAllUsers(): UserProfile[] {
 export function saveUsers(users: UserProfile[]): void {
   localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
   notifySubscribers('users_updated');
-
-  // Push to Firebase Realtime Database
-  const db = rtdb;
-  if (db) {
-    users.forEach((u) => {
-      try {
-        const cleanUser = sanitizeForFirebase(u);
-        set(ref(db, `users/${u.id}`), cleanUser).catch((e) => {
-          console.warn(`Firebase saveUser ${u.id} notice:`, e);
-        });
-      } catch (err) {
-        console.warn(`Firebase saveUser ${u.id} error:`, err);
-      }
-    });
-  }
 }
 
 export function saveSingleUser(u: UserProfile): void {
@@ -539,16 +524,19 @@ export function saveSingleUser(u: UserProfile): void {
 
   const cleanUser = sanitizeForFirebase(u);
 
+  // Use update / PATCH exclusively to prevent race conditions from overwriting remote balances!
   if (rtdb) {
     try {
-      set(ref(rtdb, `users/${u.id}`), cleanUser).catch(() => {});
+      update(ref(rtdb, `users/${u.id}`), cleanUser).catch((e) => {
+        console.warn(`Firebase update user ${u.id} notice:`, e);
+      });
     } catch {
       // Ignore
     }
   }
   try {
     fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/users/${u.id}.json`, {
-      method: 'PUT',
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cleanUser),
     }).catch(() => {});
@@ -744,6 +732,30 @@ export function addSpinsToUser(userId: string, spinsToAdd: number): UserProfile 
   return user;
 }
 
+export function setUserBlockedStatus(userId: string, blocked: boolean, reason = ''): boolean {
+  const users = getAllUsers();
+  const cleanId = String(userId).trim();
+  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+  if (!user) return false;
+
+  user.deviceBlocked = blocked;
+  (user as any).isBlocked = blocked;
+  if (blocked) {
+    user.balance = 0;
+    user.spins = 0;
+  }
+  saveSingleUser(user);
+
+  if (rtdb) {
+    update(ref(rtdb, `users/${user.id}`), {
+      deviceBlocked: blocked,
+      isBlocked: blocked,
+      ...(blocked ? { balance: 0, spins: 0, blockReason: reason || 'Banned by admin' } : {}),
+    }).catch(() => {});
+  }
+  return true;
+}
+
 export function addBalanceToUser(
   userId: string,
   amount: number,
@@ -755,6 +767,22 @@ export function addBalanceToUser(
   const cleanId = String(userId).trim();
   const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
   if (!user) return null;
+
+  // Anti-Exploit Check: Blocked / banned accounts cannot earn spin winnings
+  if (user.deviceBlocked && txType === 'spin_win') {
+    return null;
+  }
+
+  // Anti-Exploit Check: Prevent NaN, infinite, or negative amounts
+  if (isNaN(amount) || !isFinite(amount) || amount <= 0) {
+    return null;
+  }
+
+  // Anti-Tamper Check: If txType is spin_win, strictly enforce configured win amount
+  if (txType === 'spin_win') {
+    const configuredWin = getStoredSettings().spinWinAmount || 5;
+    amount = Number(configuredWin);
+  }
 
   user.balance = Math.max(0, Number((user.balance + amount).toFixed(2)));
   saveSingleUser(user);
@@ -863,7 +891,7 @@ export function decrementUserSpin(userId: string): boolean {
   const users = getAllUsers();
   const cleanId = String(userId).trim();
   const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
-  if (!user || user.spins <= 0) return false;
+  if (!user || user.spins <= 0 || user.deviceBlocked) return false;
 
   user.spins -= 1;
   saveSingleUser(user);
@@ -1094,22 +1122,58 @@ export async function refreshUsersFromRemote(): Promise<UserProfile[]> {
 export async function requestWithdrawal(
   req: Omit<WithdrawalRequest, 'id' | 'status' | 'createdAt'>
 ): Promise<{ success: boolean; error?: string; request?: WithdrawalRequest }> {
-  const settings = getStoredSettings();
-  const users = getAllUsers();
   const cleanUserId = String(req.userId).trim();
-  const u = users.find(x => String(x.id).trim() === cleanUserId || String(x.telegramId).trim() === cleanUserId) || getCurrentUser();
-
-  if (req.amount < settings.minWithdrawalLimit) {
-    return { success: false, error: `Minimum withdrawal amount is ₹${settings.minWithdrawalLimit}` };
+  if (!cleanUserId) {
+    return { success: false, error: 'Invalid user ID' };
   }
 
-  if (u.balance < req.amount) {
-    return { success: false, error: `Insufficient balance! Available balance is ₹${u.balance.toFixed(2)}` };
+  // 1. Double-Submission Mutex Lock per user
+  const lockKey = `__withdrawing_${cleanUserId}`;
+  if (typeof window !== 'undefined') {
+    if ((window as any)[lockKey]) {
+      return { success: false, error: 'Withdrawal already in progress. Please wait.' };
+    }
+    (window as any)[lockKey] = true;
   }
 
-  // Deduct balance immediately
-  u.balance = Number(Math.max(0, u.balance - req.amount).toFixed(2));
-  saveSingleUser(u);
+  try {
+    const settings = getStoredSettings();
+
+    // 2. Amount Sanity & Boundary Check
+    const amount = Number(req.amount);
+    if (isNaN(amount) || !isFinite(amount) || amount <= 0) {
+      return { success: false, error: 'Invalid withdrawal amount' };
+    }
+
+    if (amount < settings.minWithdrawalLimit) {
+      return { success: false, error: `Minimum withdrawal amount is ₹${settings.minWithdrawalLimit}` };
+    }
+
+    // 3. User lookup & live balance verification
+    const users = getAllUsers();
+    const u = users.find(x => String(x.id).trim() === cleanUserId || String(x.telegramId).trim() === cleanUserId) || getCurrentUser();
+
+    // 4. Ban / Block Check
+    if (u.deviceBlocked) {
+      return { success: false, error: 'Account blocked due to multiple accounts or policy violation.' };
+    }
+
+    // 5. Anti-Flood: Max 2 pending withdrawals at a time
+    const pendingRequests = getAllWithdrawals().filter(
+      w => (String(w.userId).trim() === cleanUserId || String(w.userId).trim() === String(u.id).trim()) && w.status === 'pending'
+    );
+    if (pendingRequests.length >= 2) {
+      return { success: false, error: 'Aapki pehle se pending withdrawal request process ho rahi hai. Kripya uske approve hone ka intezar karein.' };
+    }
+
+    // 6. Strict Balance Verification
+    if (u.balance < amount) {
+      return { success: false, error: `Insufficient balance! Available balance is ₹${u.balance.toFixed(2)}` };
+    }
+
+    // Deduct balance immediately
+    u.balance = Number(Math.max(0, u.balance - amount).toFixed(2));
+    saveSingleUser(u);
 
   const withdrawalId = `w_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
 
@@ -1174,6 +1238,11 @@ export async function requestWithdrawal(
   notifySubscribers('withdrawal_requested');
 
   return { success: true, request: cleanWithdrawal };
+  } finally {
+    if (typeof window !== 'undefined') {
+      delete (window as any)[lockKey];
+    }
+  }
 }
 
 export async function approveWithdrawal(withdrawalId: string): Promise<boolean> {

@@ -28,13 +28,14 @@ const WHEEL_SEGMENTS = [
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({ user, settings, onNavigate }) => {
   const [isSpinning, setIsSpinning] = useState(false);
+  const isSpinningRef = useRef(false);
   const [rotation, setRotation] = useState(0);
   const [wonModal, setWonModal] = useState<{ amount: number } | null>(null);
   const [noSpinsModal, setNoSpinsModal] = useState(false);
   const wheelRef = useRef<HTMLDivElement>(null);
 
   const handleSpinClick = () => {
-    if (isSpinning) return;
+    if (isSpinning || isSpinningRef.current || user.deviceBlocked) return;
 
     if (user.spins <= 0) {
       triggerHaptic('error');
@@ -42,9 +43,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ user, settings, onNaviga
       return;
     }
 
+    isSpinningRef.current = true;
     setIsSpinning(true);
     const decremented = decrementUserSpin(user.id);
     if (!decremented) {
+      isSpinningRef.current = false;
       setIsSpinning(false);
       triggerHaptic('error');
       setNoSpinsModal(true);
@@ -71,6 +74,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ user, settings, onNaviga
     setRotation(nextRotation);
 
     setTimeout(() => {
+      isSpinningRef.current = false;
       setIsSpinning(false);
       triggerHaptic('success');
 

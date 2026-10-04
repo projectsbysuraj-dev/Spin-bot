@@ -26,12 +26,14 @@ import {
   Minus,
   Tag,
   Wallet,
+  Receipt,
 } from 'lucide-react';
 import {
   AppSettings,
   ThemeSettings,
   ThemePreset,
   UserProfile,
+  Transaction,
 } from '../types';
 import {
   getAllWithdrawals,
@@ -49,6 +51,8 @@ import {
   addSpinsToUser,
   addBalanceToUser,
   adjustUserBalance,
+  setUserBlockedStatus,
+  getUserTransactions,
   subscribeRealtime,
   getAdminCredentials,
   verifyAdminLogin,
@@ -121,6 +125,57 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     reason: '',
     spins: '',
   });
+
+  // User Transaction History Passbook Modal state
+  const [userHistoryModal, setUserHistoryModal] = useState<{
+    isOpen: boolean;
+    user: UserProfile | null;
+    transactions: Transaction[];
+    isLoading: boolean;
+  }>({
+    isOpen: false,
+    user: null,
+    transactions: [],
+    isLoading: false,
+  });
+
+  const handleOpenUserHistory = async (targetUser: UserProfile) => {
+    triggerHaptic('light');
+    const localTxs = getUserTransactions(targetUser.id);
+    setUserHistoryModal({
+      isOpen: true,
+      user: targetUser,
+      transactions: localTxs,
+      isLoading: true,
+    });
+
+    try {
+      const resp = await fetch('https://telebot-26c11-default-rtdb.firebaseio.com/transactions.json', { cache: 'no-store' });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data && typeof data === 'object') {
+          const cleanId = String(targetUser.id).trim();
+          const cleanTg = String(targetUser.telegramId || '').trim();
+          const list = (Object.values(data) as Transaction[])
+            .filter((t) => {
+              if (!t || typeof t !== 'object') return false;
+              const uid = String(t.userId || '').trim();
+              return uid === cleanId || (cleanTg && uid === cleanTg);
+            })
+            .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          setUserHistoryModal((prev) => ({
+            ...prev,
+            transactions: list,
+            isLoading: false,
+          }));
+          return;
+        }
+      }
+    } catch {
+      // Fallback to local
+    }
+    setUserHistoryModal((prev) => ({ ...prev, isLoading: false }));
+  };
 
   // Security / Password change state
   const [currentPassInput, setCurrentPassInput] = useState('');
@@ -414,6 +469,49 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       setBalanceToAdd('');
       setUsers(getAllUsers());
       setTimeout(() => setUserActionToast(null), 3500);
+    }
+  };
+
+  const handleToggleBlockUser = (targetUser: UserProfile) => {
+    const isCurrentlyBlocked = targetUser.deviceBlocked || (targetUser as any).isBlocked;
+    if (isCurrentlyBlocked) {
+      setConfirmDialog({
+        isOpen: true,
+        title: `Unban User #${targetUser.id}`,
+        message: `Kya aap ${targetUser.name} ko UNBAN karna chahte hain? User dobara app aur spins khel sakega.`,
+        confirmLabel: 'Unban User ✅',
+        confirmColor: 'emerald',
+        onConfirm: async () => {
+          triggerHaptic('success');
+          setUserBlockedStatus(targetUser.id, false);
+          setUsers(getAllUsers());
+          showWithdrawalToast(`✅ User #${targetUser.id} (${targetUser.name}) has been unbanned!`);
+          setConfirmDialog(null);
+        },
+      });
+    } else {
+      setConfirmDialog({
+        isOpen: true,
+        title: `🚨 BAN & ZERO USER #${targetUser.id}`,
+        message: `Kya aap ${targetUser.name} ko BAN karna chahte hain?\n\n• Iska Balance ₹0 ho jayega\n• Spins 0 ho jayenge\n• Sabhi pending withdrawals reject ho jayengi\n• Device permanently block ho jayega!`,
+        confirmLabel: 'Yes, Ban & Zero Out 🚫',
+        confirmColor: 'red',
+        onConfirm: async () => {
+          triggerHaptic('error');
+          setUserBlockedStatus(targetUser.id, true, 'Banned by admin for fake referrals/exploits');
+          const userPending = withdrawals.filter(
+            (w) => w.userId === targetUser.id && w.status === 'pending'
+          );
+          for (const w of userPending) {
+            await rejectWithdrawal(w.id, 'User banned by admin for fraud');
+          }
+          setUsers(getAllUsers());
+          const updatedW = await refreshWithdrawalsFromRemote();
+          setWithdrawals(updatedW);
+          showWithdrawalToast(`🚫 User #${targetUser.id} (${targetUser.name}) BANNED & Balance set to ₹0!`);
+          setConfirmDialog(null);
+        },
+      });
     }
   };
 
@@ -1163,9 +1261,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                           </div>
                         </div>
                       </div>
-                      <span className="text-xs font-bold text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 px-2.5 py-0.5 rounded-full">
-                        ₹{u.balance.toFixed(2)}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        {u.deviceBlocked && (
+                          <span className="text-[10px] font-black text-rose-300 bg-rose-950/90 border border-rose-800/80 px-2 py-0.5 rounded-full flex items-center gap-1">
+                            <span>🚫</span>
+                            <span>BANNED</span>
+                          </span>
+                        )}
+                        <span className="text-xs font-bold text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 px-2.5 py-0.5 rounded-full">
+                          ₹{u.balance.toFixed(2)}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-3 gap-2 mt-4 text-center">
@@ -1273,6 +1379,39 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                         Apply
                       </button>
                     </div>
+
+                    {/* View User Passbook / Transactions History */}
+                    <button
+                      type="button"
+                      onClick={() => handleOpenUserHistory(u)}
+                      className="w-full py-2 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 bg-sky-950/40 hover:bg-sky-900/50 text-sky-300 border border-sky-800/40 hover:border-sky-500"
+                    >
+                      <Receipt className="w-3.5 h-3.5 text-sky-400" />
+                      <span>📜 View Passbook / History (खाता चेक करें)</span>
+                    </button>
+
+                    {/* Ban / Unban Cheater Action */}
+                    <button
+                      type="button"
+                      onClick={() => handleToggleBlockUser(u)}
+                      className={`w-full py-2 px-3 rounded-xl text-xs font-black transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 border ${
+                        u.deviceBlocked
+                          ? 'bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border-emerald-500/40'
+                          : 'bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border-rose-500/40'
+                      }`}
+                    >
+                      {u.deviceBlocked ? (
+                        <>
+                          <span>✅</span>
+                          <span>Unban User #{u.id}</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>🚫</span>
+                          <span>Ban User &amp; Zero Out Balance</span>
+                        </>
+                      )}
+                    </button>
                   </div>
                 </div>
               ))}
@@ -2060,6 +2199,131 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 ) : (
                   <span>Confirm &amp; Set Balance 🎯</span>
                 )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* User Transaction History / Passbook Modal */}
+      {userHistoryModal && userHistoryModal.isOpen && userHistoryModal.user && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-lg rounded-3xl p-6 shadow-2xl animate-scale-up max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 shrink-0">
+              <div className="flex items-center gap-2">
+                <Receipt className="w-5 h-5 text-sky-400" />
+                <div>
+                  <h3 className="font-['Outfit'] font-black text-base text-white">
+                    Passbook &amp; Transaction History
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    User: <strong className="text-white">{userHistoryModal.user.name}</strong> (#{userHistoryModal.user.id})
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setUserHistoryModal((prev) => ({ ...prev, isOpen: false }))}
+                className="w-8 h-8 rounded-full bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center text-sm font-bold cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Current Summary */}
+            <div className="grid grid-cols-2 gap-2 my-3 p-3 bg-slate-950 rounded-2xl border border-slate-800 shrink-0">
+              <div>
+                <span className="text-[10px] text-slate-500 font-bold block uppercase tracking-wider">Wallet Balance</span>
+                <strong className="text-emerald-400 text-lg font-['Outfit'] font-black">
+                  ₹{userHistoryModal.user.balance.toFixed(2)}
+                </strong>
+              </div>
+              <div className="text-right">
+                <span className="text-[10px] text-slate-500 font-bold block uppercase tracking-wider">Spins / Friends</span>
+                <span className="text-sky-300 text-xs font-bold font-mono">
+                  {userHistoryModal.user.spins} spins | {userHistoryModal.user.friendsJoined || 0} friends
+                </span>
+              </div>
+            </div>
+
+            {/* Transaction List */}
+            <div className="overflow-y-auto space-y-2 flex-1 pr-1 custom-scrollbar">
+              {userHistoryModal.isLoading ? (
+                <div className="py-8 text-center text-slate-400 text-xs">
+                  <RotateCw className="w-5 h-5 animate-spin mx-auto mb-2 text-sky-400" />
+                  Fetching live history from database...
+                </div>
+              ) : userHistoryModal.transactions.length === 0 ? (
+                <div className="py-8 text-center text-slate-500 text-xs font-semibold">
+                  No transaction records found for this user.
+                </div>
+              ) : (
+                userHistoryModal.transactions.map((tx) => (
+                  <div
+                    key={tx.id}
+                    className="p-3 bg-slate-950/80 rounded-xl border border-slate-800 flex items-center justify-between text-xs gap-2"
+                  >
+                    <div>
+                      <div className="font-bold text-slate-200 text-xs leading-snug">
+                        {tx.description}
+                      </div>
+                      <div className="flex items-center gap-2 mt-1">
+                        <span className="text-[10px] text-slate-500 font-mono">
+                          {new Date(tx.createdAt).toLocaleString([], {
+                            month: 'short',
+                            day: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </span>
+                        <span
+                          className={`text-[9px] font-black uppercase px-2 py-0.2 rounded-full ${
+                            tx.status === 'completed'
+                              ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800/40'
+                              : tx.status === 'pending'
+                              ? 'bg-amber-950/80 text-amber-400 border border-amber-800/40'
+                              : 'bg-rose-950/80 text-rose-400 border border-rose-800/40'
+                          }`}
+                        >
+                          {tx.status}
+                        </span>
+                        <span className="text-[10px] text-slate-500 font-mono">
+                          #{tx.id}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="text-right shrink-0">
+                      <span
+                        className={`font-['Outfit'] font-black text-sm block ${
+                          tx.type === 'referral_bonus'
+                            ? 'text-sky-400'
+                            : tx.amount > 0
+                            ? 'text-emerald-400'
+                            : tx.amount < 0
+                            ? 'text-rose-400'
+                            : 'text-slate-300'
+                        }`}
+                      >
+                        {tx.type === 'referral_bonus'
+                          ? '+1 SPIN'
+                          : tx.amount !== 0
+                          ? `${tx.amount > 0 ? '+' : '-'}₹${Math.abs(tx.amount).toFixed(2)}`
+                          : '₹0.00'}
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="pt-3 border-t border-slate-800 mt-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setUserHistoryModal((prev) => ({ ...prev, isOpen: false }))}
+                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs cursor-pointer"
+              >
+                Close Passbook
               </button>
             </div>
           </div>

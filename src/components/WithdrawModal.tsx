@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { X, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
 import { AppSettings, UserProfile, WithdrawalMethod } from '../types';
 import { requestWithdrawal, syncUserWithRemote, addBalanceToUser } from '../services/store';
@@ -26,6 +26,7 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
   const [ifsc, setIfsc] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const isSubmittingRef = useRef(false);
   const [liveBalance, setLiveBalance] = useState<number>(user.balance);
 
   // Sync latest user balance from database on modal open
@@ -39,13 +40,17 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isSubmitting) return;
+    if (isSubmitting || isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    setIsSubmitting(true);
     setError(null);
 
     const numAmount = parseFloat(amount);
     if (isNaN(numAmount) || !isFinite(numAmount) || numAmount <= 0 || numAmount < settings.minWithdrawalLimit) {
       setError(`Minimum withdrawal amount is ₹${settings.minWithdrawalLimit}`);
       triggerHaptic('error');
+      isSubmittingRef.current = false;
+      setIsSubmitting(false);
       return;
     }
 
@@ -64,6 +69,8 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
     if (numAmount > currentBal) {
       setError(`Insufficient balance! Your available balance is ₹${currentBal.toFixed(2)}`);
       triggerHaptic('error');
+      isSubmittingRef.current = false;
+      setIsSubmitting(false);
       return;
     }
 
@@ -71,22 +78,27 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
       if (!upiId.trim() || !upiId.includes('@')) {
         setError('Please enter a valid UPI ID (e.g. username@okhdfcbank or 9876543210@paytm)');
         triggerHaptic('error');
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
         return;
       }
     } else {
       if (!accountNumber.trim() || accountNumber.length < 8) {
         setError('Please enter a valid Bank Account Number');
         triggerHaptic('error');
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
         return;
       }
       if (!ifsc.trim() || ifsc.length < 5) {
         setError('Please enter a valid IFSC code (e.g. HDFC0001234)');
         triggerHaptic('error');
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
         return;
       }
     }
 
-    setIsSubmitting(true);
     triggerHaptic('medium');
 
     try {
@@ -107,6 +119,7 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
 
       const result = await requestWithdrawal(withdrawalPayload);
 
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
 
       if (result.success) {
@@ -117,6 +130,7 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
         triggerHaptic('error');
       }
     } catch (err: any) {
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
       setError(err?.message || 'Error processing withdrawal. Please try again.');
       triggerHaptic('error');

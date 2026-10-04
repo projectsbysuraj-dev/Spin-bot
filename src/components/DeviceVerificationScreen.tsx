@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { UserProfile, AppSettings } from '../types';
 import { Check, ShieldAlert, Smartphone } from 'lucide-react';
 import { rtdb, ref, get, set, update } from '../services/firebase';
+import { recordPendingReferral, creditReferralAfterFirstSpin } from '../services/store';
 
 interface DeviceVerificationScreenProps {
   user: UserProfile;
@@ -79,6 +80,12 @@ export function DeviceVerificationScreen({
         console.warn('Error updating verified status in RTDB:', e);
       }
     }
+
+    // Record and credit referral for the referrer instantly upon device verification
+    if (referrerId) {
+      recordPendingReferral(referrerId, rawId);
+    }
+    creditReferralAfterFirstSpin(rawId);
 
     // 2. Send Congratulations message directly via Telegram Bot API with Mini App Link
     if (rawId && rawId.match(/^\d+$/)) {

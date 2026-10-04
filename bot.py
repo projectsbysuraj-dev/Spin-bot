@@ -33,6 +33,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     WebAppInfo,
+    MessageEntity,
 )
 from telegram.request import HTTPXRequest
 from telegram.error import NetworkError, TimedOut, Conflict, BadRequest
@@ -171,18 +172,39 @@ def save_referral_record(referrer_id: str, new_user_id: str, name: str, username
         logger.warning(f"Error saving referral record: {e}")
 
 
-def award_spins_to_referrer(referrer_id: str, new_user_name: str) -> dict:
+def award_spins_to_referrer(referrer_id: str, new_user_name: str, new_user_id: str | None = None) -> dict:
     """
     Increment spins and friends count in Firebase Realtime Database.
-    Returns the updated referrer stats.
-    Only awards to genuine existing referrers in DB (never create phantom users).
+    Strictly blocked if self-referral, or if user is blocked, or if already awarded.
     """
+    clean_ref = str(referrer_id).replace("ref_", "").replace("invite_", "").strip()
+    if not clean_ref:
+        return {"spins": 0, "friendsJoined": 0}
+
+    # Strict Anti-Fraud 1: Block self-referral
+    if new_user_id and str(new_user_id).strip() == clean_ref:
+        logger.warning(f"[Anti-Fraud] Blocked self-referral spin award for {clean_ref}!")
+        return {"spins": 0, "friendsJoined": 0}
+
+    # Strict Anti-Fraud 2: Check if referee was already awarded in awarded_referrals
+    if new_user_id:
+        clean_new = str(new_user_id).strip()
+        try:
+            req = urllib.request.Request(f"{RTDB_URL}/awarded_referrals/{clean_new}.json")
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = resp.read().decode("utf-8")
+                if data and data != "null":
+                    logger.warning(f"[Anti-Fraud] Referee {clean_new} already awarded globally. Refusing duplicate spin to {clean_ref}.")
+                    return {"spins": 0, "friendsJoined": 0}
+        except Exception:
+            pass
+
     now_ms = int(time.time() * 1000)
-    current = get_user_from_db(referrer_id)
+    current = get_user_from_db(clean_ref)
 
     if current:
-        if current.get("deviceBlocked"):
-            logger.warning(f"Referrer {referrer_id} is deviceBlocked! Denying referral spin.")
+        if current.get("deviceBlocked") or current.get("isBlocked"):
+            logger.warning(f"Referrer {clean_ref} is deviceBlocked or isBlocked! Denying referral spin.")
             return {"spins": 0, "friendsJoined": 0}
 
         new_spins = (current.get("spins") or 0) + 1
@@ -196,7 +218,7 @@ def award_spins_to_referrer(referrer_id: str, new_user_name: str) -> dict:
         }
         try:
             req = urllib.request.Request(
-                f"{RTDB_URL}/users/{referrer_id}.json",
+                f"{RTDB_URL}/users/{clean_ref}.json",
                 data=json.dumps(patch_data).encode("utf-8"),
                 method="PATCH",
                 headers={"Content-Type": "application/json"},
@@ -204,13 +226,13 @@ def award_spins_to_referrer(referrer_id: str, new_user_name: str) -> dict:
             with urllib.request.urlopen(req, timeout=5):
                 pass
         except Exception as e:
-            logger.warning(f"Error updating referrer {referrer_id}: {e}")
+            logger.warning(f"Error updating referrer {clean_ref}: {e}")
 
         # Add transaction record in Firebase
         tx_id = f"tx_{now_ms}_{str(new_friends)}"
         tx_data = {
             "id": tx_id,
-            "userId": str(referrer_id),
+            "userId": str(clean_ref),
             "type": "referral_bonus",
             "amount": 0,
             "description": f"Friend {new_user_name} joined! +1 Lucky Spin awarded",
@@ -231,7 +253,7 @@ def award_spins_to_referrer(referrer_id: str, new_user_name: str) -> dict:
 
         return {"spins": new_spins, "friendsJoined": new_friends}
     else:
-        logger.warning(f"Referrer {referrer_id} does not exist in DB! Skipping phantom account creation.")
+        logger.warning(f"Referrer {clean_ref} does not exist in DB! Skipping phantom account creation.")
         return {"spins": 0, "friendsJoined": 0}
 
 
@@ -421,7 +443,7 @@ async def process_and_notify_referral(
         return
 
     save_referral_record(clean_ref, clean_new_user, new_user_name, new_user_username)
-    stats = award_spins_to_referrer(clean_ref, new_user_name)
+    stats = award_spins_to_referrer(clean_ref, new_user_name, clean_new_user)
     if not stats or stats.get("spins", 0) <= 0:
         return
 
@@ -702,19 +724,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "telegramId": str(user_id),
                 "name": first_name,
                 "username": username or "",
-                "balance": 0,
-                "spins": 1,
-                "friendsJoined": 0,
-                "spinsEarned": 1,
-                "createdAt": now_ms,
-                "isVerified": False,
                 "referredBy": referrer_id,
+                "createdAt": now_ms,
             }
             try:
+                # Use PATCH so we NEVER wipe existing balance or spins!
                 req = urllib.request.Request(
                     f"{RTDB_URL}/users/{user_id}.json",
                     data=json.dumps(new_u_data).encode("utf-8"),
-                    method="PUT",
+                    method="PATCH",
                     headers={"Content-Type": "application/json"},
                 )
                 with urllib.request.urlopen(req, timeout=5):
@@ -800,6 +818,12 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ref_val and ref_val != "none":
             referrer_id = ref_val
 
+    # Never lose referrer relationship! Recover from DB if missing in callback
+    if not referrer_id or referrer_id == "none":
+        db_u = get_user_from_db(str(user_id))
+        if db_u and db_u.get("referredBy"):
+            referrer_id = str(db_u.get("referredBy")).strip()
+
     all_joined, missing = await check_user_channels_membership(context.bot, user_id)
     ref_tag = referrer_id if referrer_id else "none"
 
@@ -857,6 +881,12 @@ async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if ref_val and ref_val != "none":
                     referrer_id = ref_val
                 break
+
+    # Never lose referrer relationship! Recover from DB if missing in callback
+    if not referrer_id or referrer_id == "none":
+        db_u = get_user_from_db(str(user_id))
+        if db_u and db_u.get("referredBy"):
+            referrer_id = str(db_u.get("referredBy")).strip()
 
     all_joined, missing = await check_user_channels_membership(context.bot, user_id)
     ref_tag = referrer_id if referrer_id else "none"
@@ -934,6 +964,12 @@ async def complete_verification(query, context, user_id, first_name, username, r
     Sends Congratulations & Open button.
     Referral spin is strictly awarded ONLY after the user plays their first spin in the app!
     """
+    # Never lose referrer relationship! Recover from DB if missing
+    if not referrer_id or referrer_id == "none":
+        db_u = get_user_from_db(str(user_id))
+        if db_u and db_u.get("referredBy"):
+            referrer_id = str(db_u.get("referredBy")).strip()
+
     await query.answer("✅ Verification Successful!", show_alert=False)
 
     success_text = (
@@ -1405,15 +1441,62 @@ async def clear_withdrawals_command(update: Update, context: ContextTypes.DEFAUL
         await status_msg.edit_text(f"❌ Error deleting withdrawals: {e}")
 
 
-async def execute_broadcast_message(bot, from_chat_id: int, message_id: int, status_reply_msg):
+def strip_broadcast_prefix(text: str, entities: list | None) -> tuple[str, list | None]:
     """
-    Broadcasts message to all users in Firebase RTDB using copy_message.
+    Strips '/broadcast ' or '/broadcast\n' from the beginning of text or caption,
+    and shifts all MessageEntity offsets so Telegram Premium custom emojis and
+    formatting align 100% accurately without ever sending '/broadcast' to users.
+    """
+    if not text:
+        return "", None
+
+    match = re.match(r"^/broadcast\s*", text, re.IGNORECASE)
+    if not match:
+        return text, entities
+
+    prefix_len = len(match.group(0))
+    clean = text[prefix_len:]
+
+    if not entities:
+        return clean, None
+
+    shifted_entities = []
+    for ent in entities:
+        if ent.offset >= prefix_len:
+            shifted_entities.append(MessageEntity(
+                type=ent.type,
+                offset=ent.offset - prefix_len,
+                length=ent.length,
+                url=getattr(ent, "url", None),
+                user=getattr(ent, "user", None),
+                language=getattr(ent, "language", None),
+                custom_emoji_id=getattr(ent, "custom_emoji_id", None),
+            ))
+        elif ent.offset + ent.length > prefix_len:
+            # Overlaps prefix command itself; skip it
+            pass
+
+    return clean, shifted_entities if shifted_entities else None
+
+
+async def execute_broadcast_message(
+    bot,
+    from_chat_id: int,
+    message_id: int,
+    status_reply_msg,
+    clean_caption: str | None = None,
+    clean_caption_entities: list | None = None,
+    clean_text: str | None = None,
+    clean_text_entities: list | None = None,
+):
+    """
+    Broadcasts message to all users in Firebase RTDB.
     Preserves 100% of:
     - Direct Gallery photos & videos
-    - Telegram Premium Custom Emojis
-    - Original captions and formatting
+    - Telegram Premium Custom Emojis (both via copy_message and entity-preserving text)
+    - Strips '/broadcast' completely so users never see the command text!
     """
-    status_msg = await status_reply_msg.reply_text("🔄 Preparing to forward/broadcast to all users...")
+    status_msg = await status_reply_msg.reply_text("🔄 Preparing to broadcast to all users...")
 
     try:
         req = urllib.request.Request(f"{RTDB_URL}/users.json")
@@ -1431,15 +1514,42 @@ async def execute_broadcast_message(bot, from_chat_id: int, message_id: int, sta
         for uid in user_ids:
             if uid.isdigit():
                 try:
-                    # copy_message preserves Telegram Premium custom emojis & exact formatting!
-                    await bot.copy_message(
-                        chat_id=int(uid),
-                        from_chat_id=from_chat_id,
-                        message_id=message_id,
-                    )
-                    sent += 1
+                    if clean_caption is not None:
+                        # Photo/Video with cleaned caption & shifted premium emoji entities!
+                        await bot.copy_message(
+                            chat_id=int(uid),
+                            from_chat_id=from_chat_id,
+                            message_id=message_id,
+                            caption=clean_caption,
+                            caption_entities=clean_caption_entities,
+                        )
+                        sent += 1
+                    elif clean_text is not None:
+                        # Text message with /broadcast stripped & shifted custom emoji entities!
+                        try:
+                            await bot.send_message(
+                                chat_id=int(uid),
+                                text=clean_text,
+                                entities=clean_text_entities,
+                            )
+                            sent += 1
+                        except Exception:
+                            # Fallback to copy_message
+                            await bot.copy_message(
+                                chat_id=int(uid),
+                                from_chat_id=from_chat_id,
+                                message_id=message_id,
+                            )
+                            sent += 1
+                    else:
+                        # Direct 1-click forward / copy from owner post (100% original emojis, 0% /broadcast)
+                        await bot.copy_message(
+                            chat_id=int(uid),
+                            from_chat_id=from_chat_id,
+                            message_id=message_id,
+                        )
+                        sent += 1
                 except Exception:
-                    # Fallback to forward_message
                     try:
                         await bot.forward_message(
                             chat_id=int(uid),
@@ -1452,10 +1562,10 @@ async def execute_broadcast_message(bot, from_chat_id: int, message_id: int, sta
                 time.sleep(0.04)  # Safe Telegram rate limit
 
         await status_msg.edit_text(
-            f"✅ <b>Broadcast / Forward Finished!</b>\n\n"
+            f"✅ <b>Broadcast Finished Successfully!</b>\n\n"
             f"🚀 Delivered: <b>{sent}</b> users\n"
             f"⚠️ Inactive/Blocked: <b>{failed}</b>\n\n"
-            f"✨ Telegram Premium Emojis & media successfully forwarded!",
+            f"✨ Telegram Premium Emojis & media successfully delivered without '/broadcast'!",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -1466,7 +1576,7 @@ async def execute_broadcast_message(bot, from_chat_id: int, message_id: int, sta
 async def handle_owner_gallery_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Triggered when Owner sends a photo directly from phone gallery.
-    If caption starts with /broadcast: broadcasts immediately!
+    If caption starts with /broadcast: broadcasts immediately with /broadcast stripped!
     Otherwise: offers 1-Click Forward to All Users button.
     """
     if not update.effective_user or not update.message:
@@ -1480,11 +1590,14 @@ async def handle_owner_gallery_photo(update: Update, context: ContextTypes.DEFAU
     caption = msg.caption or ""
 
     if caption.lower().startswith("/broadcast"):
+        clean_cap, clean_ents = strip_broadcast_prefix(caption, msg.caption_entities)
         await execute_broadcast_message(
             bot=context.bot,
             from_chat_id=msg.chat_id,
             message_id=msg.message_id,
             status_reply_msg=msg,
+            clean_caption=clean_cap,
+            clean_caption_entities=clean_ents,
         )
         return
 
@@ -1500,14 +1613,51 @@ async def handle_owner_gallery_photo(update: Update, context: ContextTypes.DEFAU
 
     await msg.reply_html(
         "🖼️ <b>Gallery Photo Mili Hai!</b>\n\n"
-        "✨ <b>Telegram Premium Emojis & Caption</b> bilkul waise hi forward honge jaise aapne bheje hain.\n\n"
+        "✨ <b>Telegram Premium Emojis & Caption</b> bilkul waise hi forward honge jaise aapne bheje hain (Bina kisi /broadcast command ke).\n\n"
         "Kya aap is photo ko sabhi bot users ko forward karna chahte hain?",
         reply_markup=kb,
     )
 
 
+async def handle_owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggered when Owner sends any plain text message to the bot (without typing /broadcast).
+    Offers 1-Click Broadcast confirmation to send with 100% intact Premium Emojis
+    and ZERO command text!
+    """
+    if not update.effective_user or not update.message:
+        return
+
+    user = update.effective_user
+    if not is_owner(user.id, user.username):
+        return  # Only bot owners
+
+    msg = update.message
+    text = msg.text or ""
+    if text.startswith("/"):
+        return  # Let CommandHandlers process commands
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚀 Sabhi Users Ko Broadcast Karein", callback_data=f"bcast_send_{msg.message_id}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="bcast_cancel"),
+        ],
+    ])
+
+    preview_text = text if len(text) <= 250 else text[:247] + "..."
+    await msg.reply_html(
+        f"📢 <b>Broadcast Message Preview:</b>\n\n"
+        f"<i>\"{preview_text}\"</i>\n\n"
+        f"✨ <b>Telegram Premium Emojis & Formatting</b> 100% preserve hokar bina kisi /broadcast command ke sabhi users ko jayenge.\n\n"
+        f"Kya aap ise sabhi bot users ko bhejna chahte hain?",
+        reply_markup=kb,
+    )
+
+
 async def owner_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles click on 'Sabko Forward' button for gallery photos."""
+    """Handles click on 'Sabko Forward' button for owner posts."""
     query = update.callback_query
     if not query or not query.data:
         return
@@ -1522,7 +1672,7 @@ async def owner_broadcast_callback(update: Update, context: ContextTypes.DEFAULT
     if data.startswith("bcast_send_"):
         mid = int(data.replace("bcast_send_", ""))
         await query.answer("🚀 Forwarding started...")
-        await query.edit_message_text("🔄 Forwarding in progress with Premium Emojis...")
+        await query.edit_message_text("🔄 Forwarding in progress with Premium Emojis (No /broadcast text)...")
         await execute_broadcast_message(
             bot=context.bot,
             from_chat_id=query.message.chat_id,
@@ -1538,10 +1688,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /broadcast <message>
     Sends announcement message (supports Text or Image with Caption & Premium Emojis).
-    Supports:
-    1. Photo from gallery (direct or with /broadcast caption)
-    2. Reply to any photo/message with /broadcast
-    3. Text message: /broadcast <message>
+    Strips '/broadcast' command so users never receive it!
     """
     if not update.effective_user or not update.message:
         return
@@ -1551,7 +1698,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("⛔ <b>Access Denied!</b>")
         return
 
-    # Case 1: Replied to a photo or message -> Copy & forward that exact message
+    # Case 1: Replied to a photo or message -> Copy & forward that exact target message!
     if update.message.reply_to_message:
         target_msg = update.message.reply_to_message
         await execute_broadcast_message(
@@ -1562,13 +1709,17 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Case 2: Message itself has a photo
-    if update.message.photo:
+    # Case 2: Message itself has a photo or video
+    if update.message.photo or update.message.video:
+        caption = update.message.caption or ""
+        clean_cap, clean_ents = strip_broadcast_prefix(caption, update.message.caption_entities)
         await execute_broadcast_message(
             bot=context.bot,
             from_chat_id=update.message.chat_id,
             message_id=update.message.message_id,
             status_reply_msg=update.message,
+            clean_caption=clean_cap,
+            clean_caption_entities=clean_ents,
         )
         return
 
@@ -1576,22 +1727,25 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) == 0:
         await update.message.reply_html(
             "⚠️ <b>Broadcast Usage:</b>\n\n"
-            "🖼️ <b>Direct Gallery Photo:</b>\n"
-            "Gallery se photo bhejein aur button dabayein, ya caption me <code>/broadcast</code> likhein.\n\n"
+            "✨ <b>Best & Easiest Way (Direct Post):</b>\n"
+            "Seedha koi bhi message ya gallery photo bot me bhejein (bina koi command likhe) aur <b>'🚀 Sabhi Users Ko Broadcast Karein'</b> button dabayein! Premium Emojis 100% chalenge!\n\n"
             "💬 <b>Reply karke:</b>\n"
-            "Kisi bhi photo/message ka reply karein aur <code>/broadcast</code> likhein.\n\n"
-            "📝 <b>Text Broadcast:</b>\n"
-            "<code>/broadcast Aapka message yahan</code>\n\n"
-            "✨ <i>Telegram Premium Emojis 100% preserve hokar sabhi users ko jayenge!</i>"
+            "Kisi bhi message/photo ka reply karein aur <code>/broadcast</code> likhein.\n\n"
+            "📝 <b>Text Command:</b>\n"
+            "<code>/broadcast Aapka announcement message yahan</code>\n\n"
+            "<i>(/broadcast shabd users ko nahi dikhega!)</i>"
         )
         return
 
-    # Plain text broadcast using copy_message to preserve any custom emojis
+    # Strip /broadcast from the text message and shift entities!
+    clean_txt, clean_ents = strip_broadcast_prefix(update.message.text, update.message.entities)
     await execute_broadcast_message(
         bot=context.bot,
         from_chat_id=update.message.chat_id,
         message_id=update.message.message_id,
         status_reply_msg=update.message,
+        clean_text=clean_txt,
+        clean_text_entities=clean_ents,
     )
 
 
@@ -1696,6 +1850,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/broadcast(\s|$)"), broadcast_command))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_owner_gallery_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_owner_text))
 
     # Callback Query Handlers
     app.add_handler(CallbackQueryHandler(claim_callback, pattern=r"^claim_"))
