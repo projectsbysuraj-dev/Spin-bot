@@ -41,6 +41,8 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
 )
 
@@ -1403,25 +1405,15 @@ async def clear_withdrawals_command(update: Update, context: ContextTypes.DEFAUL
         await status_msg.edit_text(f"❌ Error deleting withdrawals: {e}")
 
 
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def execute_broadcast_message(bot, from_chat_id: int, message_id: int, status_reply_msg):
     """
-    /broadcast <message>
-    Sends ONLY the announcement message (No mini app link attached).
+    Broadcasts message to all users in Firebase RTDB using copy_message.
+    Preserves 100% of:
+    - Direct Gallery photos & videos
+    - Telegram Premium Custom Emojis
+    - Original captions and formatting
     """
-    if not update.effective_user or not update.message:
-        return
-
-    user = update.effective_user
-    if not is_owner(user.id, user.username):
-        await update.message.reply_html("⛔ <b>Access Denied!</b>")
-        return
-
-    if not context.args or len(context.args) == 0:
-        await update.message.reply_html("⚠️ <b>Usage:</b> <code>/broadcast &lt;Your message here&gt;</code>")
-        return
-
-    broadcast_text = " ".join(context.args)
-    status_msg = await update.message.reply_text("🔄 Preparing broadcast to all users...")
+    status_msg = await status_reply_msg.reply_text("🔄 Preparing to forward/broadcast to all users...")
 
     try:
         req = urllib.request.Request(f"{RTDB_URL}/users.json")
@@ -1439,19 +1431,168 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for uid in user_ids:
             if uid.isdigit():
                 try:
-                    await context.bot.send_message(
+                    # copy_message preserves Telegram Premium custom emojis & exact formatting!
+                    await bot.copy_message(
                         chat_id=int(uid),
-                        text=f"📢 <b>Announcement:</b>\n\n{broadcast_text}",
-                        parse_mode="HTML",
+                        from_chat_id=from_chat_id,
+                        message_id=message_id,
                     )
                     sent += 1
                 except Exception:
-                    failed += 1
-                time.sleep(0.04)  # Safe rate limit
+                    # Fallback to forward_message
+                    try:
+                        await bot.forward_message(
+                            chat_id=int(uid),
+                            from_chat_id=from_chat_id,
+                            message_id=message_id,
+                        )
+                        sent += 1
+                    except Exception:
+                        failed += 1
+                time.sleep(0.04)  # Safe Telegram rate limit
 
-        await status_msg.edit_text(f"✅ Broadcast finished!\nDelivered: {sent} | Inactive: {failed}")
+        await status_msg.edit_text(
+            f"✅ <b>Broadcast / Forward Finished!</b>\n\n"
+            f"🚀 Delivered: <b>{sent}</b> users\n"
+            f"⚠️ Inactive/Blocked: <b>{failed}</b>\n\n"
+            f"✨ Telegram Premium Emojis & media successfully forwarded!",
+            parse_mode="HTML",
+        )
     except Exception as e:
+        logger.error(f"Error in broadcast: {e}")
         await status_msg.edit_text(f"❌ Error in broadcast: {e}")
+
+
+async def handle_owner_gallery_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggered when Owner sends a photo directly from phone gallery.
+    If caption starts with /broadcast: broadcasts immediately!
+    Otherwise: offers 1-Click Forward to All Users button.
+    """
+    if not update.effective_user or not update.message:
+        return
+
+    user = update.effective_user
+    if not is_owner(user.id, user.username):
+        return  # Only authorized bot owners
+
+    msg = update.message
+    caption = msg.caption or ""
+
+    if caption.lower().startswith("/broadcast"):
+        await execute_broadcast_message(
+            bot=context.bot,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id,
+            status_reply_msg=msg,
+        )
+        return
+
+    # Direct photo from gallery without /broadcast -> 1-Click Forward to All
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚀 Sabko Forward / Broadcast Karein", callback_data=f"bcast_send_{msg.message_id}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="bcast_cancel"),
+        ],
+    ])
+
+    await msg.reply_html(
+        "🖼️ <b>Gallery Photo Mili Hai!</b>\n\n"
+        "✨ <b>Telegram Premium Emojis & Caption</b> bilkul waise hi forward honge jaise aapne bheje hain.\n\n"
+        "Kya aap is photo ko sabhi bot users ko forward karna chahte hain?",
+        reply_markup=kb,
+    )
+
+
+async def owner_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles click on 'Sabko Forward' button for gallery photos."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    user = query.from_user
+    if not is_owner(user.id, user.username):
+        await query.answer("⛔ Only owners can perform broadcasts.", show_alert=True)
+        return
+
+    data = query.data
+
+    if data.startswith("bcast_send_"):
+        mid = int(data.replace("bcast_send_", ""))
+        await query.answer("🚀 Forwarding started...")
+        await query.edit_message_text("🔄 Forwarding in progress with Premium Emojis...")
+        await execute_broadcast_message(
+            bot=context.bot,
+            from_chat_id=query.message.chat_id,
+            message_id=mid,
+            status_reply_msg=query.message,
+        )
+    elif data == "bcast_cancel":
+        await query.answer("Broadcast cancelled")
+        await query.edit_message_text("❌ Broadcast cancelled.")
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /broadcast <message>
+    Sends announcement message (supports Text or Image with Caption & Premium Emojis).
+    Supports:
+    1. Photo from gallery (direct or with /broadcast caption)
+    2. Reply to any photo/message with /broadcast
+    3. Text message: /broadcast <message>
+    """
+    if not update.effective_user or not update.message:
+        return
+
+    user = update.effective_user
+    if not is_owner(user.id, user.username):
+        await update.message.reply_html("⛔ <b>Access Denied!</b>")
+        return
+
+    # Case 1: Replied to a photo or message -> Copy & forward that exact message
+    if update.message.reply_to_message:
+        target_msg = update.message.reply_to_message
+        await execute_broadcast_message(
+            bot=context.bot,
+            from_chat_id=target_msg.chat_id,
+            message_id=target_msg.message_id,
+            status_reply_msg=update.message,
+        )
+        return
+
+    # Case 2: Message itself has a photo
+    if update.message.photo:
+        await execute_broadcast_message(
+            bot=context.bot,
+            from_chat_id=update.message.chat_id,
+            message_id=update.message.message_id,
+            status_reply_msg=update.message,
+        )
+        return
+
+    # Case 3: Text message
+    if not context.args or len(context.args) == 0:
+        await update.message.reply_html(
+            "⚠️ <b>Broadcast Usage:</b>\n\n"
+            "🖼️ <b>Direct Gallery Photo:</b>\n"
+            "Gallery se photo bhejein aur button dabayein, ya caption me <code>/broadcast</code> likhein.\n\n"
+            "💬 <b>Reply karke:</b>\n"
+            "Kisi bhi photo/message ka reply karein aur <code>/broadcast</code> likhein.\n\n"
+            "📝 <b>Text Broadcast:</b>\n"
+            "<code>/broadcast Aapka message yahan</code>\n\n"
+            "✨ <i>Telegram Premium Emojis 100% preserve hokar sabhi users ko jayenge!</i>"
+        )
+        return
+
+    # Plain text broadcast using copy_message to preserve any custom emojis
+    await execute_broadcast_message(
+        bot=context.bot,
+        from_chat_id=update.message.chat_id,
+        message_id=update.message.message_id,
+        status_reply_msg=update.message,
+    )
 
 
 # ----------------- Owner Callback Query Handlers -----------------
@@ -1553,11 +1694,14 @@ def main():
     app.add_handler(CommandHandler(["withdrawals", "payouts"], check_withdrawals))
     app.add_handler(CommandHandler(["clearwithdrawals", "deletewithdrawals"], clear_withdrawals_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/broadcast(\s|$)"), broadcast_command))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_owner_gallery_photo))
 
     # Callback Query Handlers
     app.add_handler(CallbackQueryHandler(claim_callback, pattern=r"^claim_"))
     app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^(done_|verify_|check_)"))
     app.add_handler(CallbackQueryHandler(device_blocked_done_callback, pattern=r"^device_blocked_done$"))
+    app.add_handler(CallbackQueryHandler(owner_broadcast_callback, pattern=r"^bcast_"))
     app.add_handler(CallbackQueryHandler(owner_callback_router, pattern=r"^owner_"))
 
     # Chat Join Request Handler (For Private Channels - Request Sent)
